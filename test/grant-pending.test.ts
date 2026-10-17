@@ -50,14 +50,14 @@ describe('grant-pending', () => {
       quota: 3,
       durationMs: 60 * 60 * 1000,
     });
-    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 10, durationMs: 8 * 60 * 60 * 1000 })).toBe(true);
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 10, durationMs: 8 * 60 * 60 * 1000 })).toBe('ok');
     expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({
       quota: 10,
       durationMs: 8 * 60 * 60 * 1000,
     });
-    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: null, durationMs: null })).toBe(true);
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: null, durationMs: null })).toBe('ok');
     expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({ quota: undefined, durationMs: undefined });
-    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], 'wrong', { quota: 20 })).toBe(false);
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], 'wrong', { quota: 20 })).toBe('stale');
   });
 
   it('clearPending lifts throttle', () => {
@@ -221,17 +221,17 @@ describe('grant-pending — survives daemon restart', () => {
 
   it('limits staged after delivery are persisted (including clearing to unlimited / permanent)', () => {
     const nonce = deliveredCard();
-    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 10, durationMs: 8 * HOUR })).toBe(true);
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 10, durationMs: 8 * HOUR })).toBe('ok');
     _simulateRestartForTest();
     expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({ quota: 10, durationMs: 8 * HOUR });
-    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: null, durationMs: null })).toBe(true);
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: null, durationMs: null })).toBe('ok');
     _simulateRestartForTest();
     expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({ quota: undefined, durationMs: undefined });
   });
 
   it('limits staged before the delivery ack lands are persisted once it does', () => {
     const nonce = openPending('a1', 'oc_1', 'ou_g', 3, msg, HOUR);
-    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 7 })).toBe(true);
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 7 })).toBe('ok');
     markPendingDelivered('a1', 'oc_1', ['ou_g'], nonce);
     _simulateRestartForTest();
     expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({ quota: 7, durationMs: HOUR });

@@ -2,7 +2,7 @@
  * card-handler 群内授权动作：owner 强闸门 + nonce + 撤回卡/通知/兜底 patch。
  * Run: pnpm vitest run test/card-handler-grant.test.ts
  */
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -123,6 +123,28 @@ describe('card-handler grant actions', () => {
     expect(after.registry.getBot('h1').config.chatGrants).toBeUndefined();
     const later = await fresh({ keepPersisted: true });
     expect(later.pending.throttleReason('h1', 'oc_1', 'ou_g')).toBe('denied');
+  });
+
+  it('grant/deny are refused (card stays actionable) when the handled state cannot be saved', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    // 目标路径被非空目录占住：既写不进也删不掉 → 核销无法落盘
+    const path = pending._filePathForTest('h1');
+    rmSync(path, { force: true });
+    mkdirSync(path);
+    writeFileSync(join(path, 'occupied'), '');
+    try {
+      const unsaved = '授权状态保存失败，本次操作未生效，请稍后重试';
+      const deny = await handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), deps, 'h1');
+      expect(deny?.toast).toEqual({ type: 'error', content: unsaved });
+      const grant = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
+      expect(grant?.toast).toEqual({ type: 'error', content: unsaved });
+      expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+      expect(pending.checkNonce('h1', 'oc_1', 'ou_g', nonce)).toBe(true);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
   });
 
   it('stale nonce → expired toast, no grant', async () => {

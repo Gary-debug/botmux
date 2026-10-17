@@ -11,6 +11,8 @@
  *  - denied 冷却一并落盘，重启不会让刚被拒的人立刻再弹卡。
  *  - 过期条目（denied 冷却已过 / pending 超过 STALE_PENDING_MS 未处置）加载时直接丢弃，与内存
  *    回收同一条规则（isExpired），所以内存里顺手回收的条目不必单独回写。
+ *  - 核销（授权 / 拒绝 / 改限制）先落盘再生效：落不了盘就回滚并让调用方拒绝本次处置，
+ *    不能出现「卡已显示处置完、重启后旧 nonce 又能点」（见 persist 的 revoking）。
  *  - 文件读不出 / 损坏时按空表处理（损坏文件被隔离，见 utils/json-file.ts）：旧卡失效、节流清零，
  *    不会凭空放行任何人。
  * owner 私聊发卡名额（tryReserveOwnerDmSlot）仍是纯内存：只是限流，重启清零无害。
@@ -140,10 +142,20 @@ function serialize(map: Map<string, Entry>, withMessageData: boolean): string {
   return `${JSON.stringify({ version: FILE_VERSION, entries })}\n`;
 }
 
-/** 把某个 bot 的表整体回写。失败只告警：内存仍是权威，只是这段时间的变更扛不过重启。 */
-function persist(larkAppId: string): void {
+function errCode(err: unknown): string | undefined {
+  return err && typeof err === 'object' && 'code' in err ? String((err as NodeJS.ErrnoException).code) : undefined;
+}
+
+/**
+ * 把某个 bot 的表整体回写，返回「磁盘上不会复活内存里已失效的 nonce」是否成立。
+ *  - 新增（revoking=false，如卡片送达）写失败：旧文件只是少了这张新卡，依旧安全 → 告警，返回 true。
+ *  - 核销（revoking=true）写失败：旧文件里还留着已失效的 nonce / 更宽的限制，重启后会复活。先删掉
+ *    整个文件兜底（磁盘写满时 unlink 照样能成功；代价是其它卡这段时间扛不过重启，下次写成功即恢复），
+ *    连删都失败才返回 false，由调用方回滚、拒绝本次处置。
+ */
+function persist(larkAppId: string, revoking: boolean): boolean {
   const map = tables.get(larkAppId);
-  if (!map) return;
+  if (!map) return true;
   const path = filePathFor(larkAppId);
   try {
     let body: string;
@@ -157,10 +169,27 @@ function persist(larkAppId: string): void {
     mkdirSync(dirname(path), { recursive: true });
     // 含原始消息正文，按凭据级文件处理：0600、不跟随叶子 symlink。
     atomicWriteFileSync(path, body, { mode: 0o600, followTargetSymlink: false });
+    return true;
   } catch (err) {
-    logger.warn(`[grant-pending:${larkAppId}] persist to ${path} failed; pending grant cards may not survive a restart: ${errorMessage(err)}`);
+    if (!revoking) {
+      logger.warn(`[grant-pending:${larkAppId}] persist to ${path} failed; newly sent grant cards may not survive a restart: ${errorMessage(err)}`);
+      return true;
+    }
+    try {
+      unlinkSync(path);
+    } catch (unlinkErr) {
+      if (errCode(unlinkErr) !== 'ENOENT') {
+        logger.error(`[grant-pending:${larkAppId}] cannot persist nor remove ${path}; refusing the change so a handled card cannot revive after a restart: write=${errorMessage(err)} unlink=${errorMessage(unlinkErr)}`);
+        return false;
+      }
+    }
+    logger.warn(`[grant-pending:${larkAppId}] persist to ${path} failed, removed it instead (handled cards stay dead; other pending cards will not survive a restart until the next successful write): ${errorMessage(err)}`);
+    return true;
   }
 }
+
+/** 落盘写入的结果：stale = nonce 不匹配 / 已处置；unsaved = 核销落不了盘，已回滚、本次处置未生效。 */
+export type PendingWriteResult = 'ok' | 'stale' | 'unsaved';
 
 /** 回收已无效条目，避免 table 随「不同未授权用户 × 群」无限增长。
  *  - denied：冷却已过 → 不再节流，纯属垃圾，删除（允许将来重新申请）。
@@ -209,7 +238,8 @@ export function openPendingMulti(
   const map = tableFor(larkAppId);
   pruneStale(ts);
   // 被新卡覆盖的旧条目可能已落盘（旧 nonce / denied）；新条目尚未送达不落盘，
-  // 所以要回写一次把旧的抹掉，否则重启后旧卡复活。
+  // 所以要回写一次把旧的抹掉，否则重启后旧卡复活。连文件都删不掉（persist 返回 false）时
+  // 这里不回滚：能复活的只是同一批目标的旧授权卡 / 冷却，处置它仍需管理员，不会放大授权。
   let replacedPersisted = false;
   for (const target of targets) {
     const k = key(chatId, target);
@@ -217,7 +247,7 @@ export function openPendingMulti(
     if (prev && isPersisted(prev)) replacedPersisted = true;
     map.set(k, { state: 'pending', nonce, ts, quota, durationMs, messageData });
   }
-  if (replacedPersisted) persist(larkAppId);
+  if (replacedPersisted) persist(larkAppId, true);
   return nonce;
 }
 
@@ -233,7 +263,7 @@ export function markPendingDelivered(larkAppId: string, chatId: string, targets:
       changed = true;
     }
   }
-  if (changed) persist(larkAppId);
+  if (changed) persist(larkAppId, false);
 }
 
 /** 回读 pending 上挂的限制（owner 点授权按钮时用）。 */
@@ -246,17 +276,19 @@ export function getPendingGrantLimits(
   return e && e.state === 'pending' ? { quota: e.quota, durationMs: e.durationMs } : undefined;
 }
 
-/** 同一张多目标卡共用一组限制；nonce 不匹配时拒绝暂存。 */
+/** 同一张多目标卡共用一组限制；nonce 不匹配时拒绝暂存（stale）。已落盘的卡改限制落不了盘时
+ *  回滚（unsaved）：否则重启后会按磁盘上的旧限制授权，旧限制可能更宽。 */
 export function updatePendingGrantLimits(
   larkAppId: string,
   chatId: string,
   targets: string[],
   nonce: string,
   patch: { quota?: number | null; durationMs?: number | null },
-): boolean {
+): PendingWriteResult {
   const map = tableFor(larkAppId);
   const entries = targets.map(target => map.get(key(chatId, target)));
-  if (entries.some(e => !e || e.state !== 'pending' || e.nonce !== nonce)) return false;
+  if (entries.some(e => !e || e.state !== 'pending' || e.nonce !== nonce)) return 'stale';
+  const before = (entries as Entry[]).map(e => ({ quota: e.quota, durationMs: e.durationMs }));
   for (const e of entries as Entry[]) {
     if ('quota' in patch) {
       if (patch.quota === null || patch.quota === undefined) delete e.quota;
@@ -267,8 +299,70 @@ export function updatePendingGrantLimits(
       else e.durationMs = patch.durationMs;
     }
   }
-  if ((entries as Entry[]).some(isPersisted)) persist(larkAppId);
-  return true;
+  if ((entries as Entry[]).some(isPersisted) && !persist(larkAppId, true)) {
+    (entries as Entry[]).forEach((e, i) => {
+      delete e.quota;
+      delete e.durationMs;
+      if (before[i]!.quota !== undefined) e.quota = before[i]!.quota;
+      if (before[i]!.durationMs !== undefined) e.durationMs = before[i]!.durationMs;
+    });
+    return 'unsaved';
+  }
+  return 'ok';
+}
+
+/** claimPendingGrant 的结果：ok 时附带卡上暂存的限制 / 重放消息（取第一个目标），以及授权全部失败时的回滚。 */
+export type PendingClaim =
+  | {
+      ok: true;
+      quota?: number;
+      durationMs?: number;
+      messageData?: any;
+      /** 授权全部落库失败时调用：把 pending 放回去，管理员可以再点原卡重试。 */
+      restore: () => void;
+    }
+  | { ok: false; reason: Exclude<PendingWriteResult, 'ok'> };
+
+/**
+ * 管理员点「授权」：先核销整张卡的 nonce（内存 + 磁盘），再由调用方落授权。核销落不了盘就
+ * 回滚、返回 unsaved，调用方不授权——否则旧 nonce 会在重启后复活，迟到的回调能再授权一次、
+ * 把额度和有效期重置。
+ */
+export function claimPendingGrant(
+  larkAppId: string,
+  chatId: string,
+  targets: string[],
+  nonce: string,
+): PendingClaim {
+  const map = tableFor(larkAppId);
+  const keys = targets.map(target => key(chatId, target));
+  const entries = keys.map(k => map.get(k));
+  if (!entries.length || entries.some(e => !e || e.state !== 'pending' || e.nonce !== nonce)) {
+    return { ok: false, reason: 'stale' };
+  }
+  const claimed = entries as Entry[];
+  for (const k of keys) map.delete(k);
+  if (claimed.some(isPersisted) && !persist(larkAppId, true)) {
+    keys.forEach((k, i) => map.set(k, claimed[i]!));
+    return { ok: false, reason: 'unsaved' };
+  }
+  const first = claimed[0]!;
+  return {
+    ok: true,
+    quota: first.quota,
+    durationMs: first.durationMs,
+    messageData: first.messageData,
+    restore: () => {
+      let restored = false;
+      keys.forEach((k, i) => {
+        // 授权落库期间这个目标又开了新卡 / 被拒绝：以新的为准，不覆盖。
+        if (map.has(k)) return;
+        map.set(k, claimed[i]!);
+        restored = true;
+      });
+      if (restored && claimed.some(isPersisted)) persist(larkAppId, false);
+    },
+  };
 }
 
 /** 回读 pending 上挂的原始消息事件（授权成功后重放，让用户无需再 @ 一遍）。无 / 非 pending → undefined。 */
@@ -283,23 +377,42 @@ export function checkNonce(larkAppId: string, chatId: string, target: string, no
   return !!e && e.state === 'pending' && e.nonce === nonce;
 }
 
-/** 授权成功 / revoke → 清除，允许将来重新申请。 */
-export function clearPending(larkAppId: string, chatId: string, target: string): void {
+/** 撤掉一条 pending（发卡失败回滚等），允许将来重新申请。已落盘的条目撤不掉盘时回滚并返回 false。 */
+export function clearPending(larkAppId: string, chatId: string, target: string): boolean {
   const map = tableFor(larkAppId);
   const k = key(chatId, target);
   const prev = map.get(k);
-  if (!prev) return;
+  if (!prev) return true;
   map.delete(k);
-  if (isPersisted(prev)) persist(larkAppId);
+  if (isPersisted(prev) && !persist(larkAppId, true)) {
+    map.set(k, prev);
+    return false;
+  }
+  return true;
 }
 
-/** 拒绝 → 转 denied 冷却态（不清除），旧 nonce 失效，冷却期内不再弹卡。 */
-export function markDenied(larkAppId: string, chatId: string, target: string): void {
+/** 拒绝 → 全部目标转 denied 冷却态（不清除），旧 nonce 失效，冷却期内不再弹卡。
+ *  落不了盘时整体回滚并返回 false，调用方不应展示「已拒绝」。 */
+export function denyPending(larkAppId: string, chatId: string, targets: string[]): boolean {
   const now = Date.now();
   const map = tableFor(larkAppId);
   pruneStale(now);
-  map.set(key(chatId, target), { state: 'denied', ts: now });
-  persist(larkAppId);
+  const keys = targets.map(target => key(chatId, target));
+  const prev = keys.map(k => map.get(k));
+  for (const k of keys) map.set(k, { state: 'denied', ts: now });
+  if (!persist(larkAppId, true)) {
+    keys.forEach((k, i) => {
+      const p = prev[i];
+      if (p) map.set(k, p);
+      else map.delete(k);
+    });
+    return false;
+  }
+  return true;
+}
+
+export function markDenied(larkAppId: string, chatId: string, target: string): boolean {
+  return denyPending(larkAppId, chatId, [target]);
 }
 
 /** 入口 A 节流判断：pending 中、或 denied 冷却未过 → true（静默不发卡）。
