@@ -1495,7 +1495,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
     }
     // 部分成功：失败 target 的 pending 必须立刻清掉——卡马上要撤回（owner 无法再点原卡重试），
-    // 而 pending 无 TTL，isThrottled 会永久挡住失败 target 后续的自助申请直到 daemon 重启。
+    // 而 pending 落了盘、要 24h 才过期（daemon 重启也清不掉），isThrottled 会一直挡住失败 target 后续的自助申请。
     // 清掉后失败 target 可重新走 /grant 或自助申请；失败清单下面在原线程明确告知 owner，
     // 不做「撤卡 + 静默失败 + pending 永久卡住」。
     for (const f of failed) clearPending(larkAppId, grantChatId, f.openId);

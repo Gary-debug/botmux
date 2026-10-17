@@ -51,7 +51,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -2373,6 +2373,8 @@ export async function maybeSendGrantRequestCard(
       larkAppId, chatId, requesterOpenId, name: String(name), approver, nonce, quota, durationMs, delivery,
     });
     if (sentToDm) {
+      // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
+      markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
       await replyMessage(larkAppId, message.message_id, t('card.grant.request_forwarded', undefined, loc))
         .catch(err => logger.debug(`grant request forwarded ack failed: ${err}`));
       return;
@@ -2392,13 +2394,17 @@ export async function maybeSendGrantRequestCard(
     },
     loc,
   );
-  await replyMessage(larkAppId, message.message_id, card, 'interactive')
-    .catch(err => {
-      // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
-      // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
-      clearPending(larkAppId, chatId, requesterOpenId);
-      logger.debug(`grant request card send failed: ${err}`);
-    });
+  try {
+    await replyMessage(larkAppId, message.message_id, card, 'interactive');
+  } catch (err) {
+    // 发卡失败必须撤掉刚开的 pending，否则该发送方被节流压死、owner 永远看不到卡片，
+    // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
+    clearPending(larkAppId, chatId, requesterOpenId);
+    logger.debug(`grant request card send failed: ${err}`);
+    return;
+  }
+  // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。
+  markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
 }
 
 /** 把自助申请卡投到管理员私聊。返回 false = 没发出去（owner 维度超限或发送失败），由调用方撤 pending。 */

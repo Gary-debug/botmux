@@ -47,11 +47,14 @@ const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid')
 // 一次宏任务（setTimeout 0）会等整条后台微任务链排空，再断言后台副作用（reply/delete）。
 const flushBackground = () => new Promise(resolve => setTimeout(resolve, 0));
 
-async function fresh() {
+// 每次 fresh() 都是一份全新的模块图（≈ 新起一个 daemon 进程）。grant-pending 现在落盘，
+// 默认把上一个用例留下的文件一并清掉；keepPersisted 用来模拟「daemon 重启」。
+async function fresh(opts: { keepPersisted?: boolean } = {}) {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
   const pending = await import('../src/im/lark/grant-pending.js');
   const handler = await import('../src/im/lark/card-handler.js');
+  if (!opts.keepPersisted) pending._resetForTest();
   registry.loadBotConfigs().forEach(c => registry.registerBot(c));
   return { registry, pending, handler };
 }
@@ -82,6 +85,44 @@ describe('card-handler grant actions', () => {
     const res = await handler.handleCardAction(action('grant_chat', { operator: 'ou_x', nonce }), deps, 'h1');
     expect(res?.toast?.type).toBe('error');
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
+  it('card delivered before a daemon restart still grants afterwards and replays the original message', async () => {
+    const before = await fresh();
+    const messageData = { message: { message_id: 'om_trigger', chat_id: 'oc_1', chat_type: 'group', content: '{"text":"@bot hi"}' }, sender: { sender_id: { open_id: 'ou_g' } } };
+    const nonce = before.pending.openPending('h1', 'oc_1', 'ou_g', 3, messageData, 60 * 60 * 1000);
+    before.pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+
+    const after = await fresh({ keepPersisted: true });
+    const replayGrantedMessage = vi.fn();
+    const res = await after.handler.handleCardAction(
+      action('grant_chat', { nonce }, 'om_card'),
+      { ...deps, replayGrantedMessage },
+      'h1',
+    );
+    expect(res?.toast).toBeUndefined();
+    expect(JSON.stringify(res)).toContain('ou_g');
+    const cfg = after.registry.getBot('h1').config;
+    expect(cfg.chatGrants).toEqual({ oc_1: ['ou_g'] });
+    expect(cfg.quotaState?.['chat:oc_1:ou_g']).toEqual({ limit: 3, used: 0 });
+    expect(replayGrantedMessage).toHaveBeenCalledWith(messageData, 'h1');
+    // 已处置的卡在下一次重启后也不会复活
+    const later = await fresh({ keepPersisted: true });
+    expect(later.pending.checkNonce('h1', 'oc_1', 'ou_g', nonce)).toBe(false);
+  });
+
+  it('deny on a card delivered before a daemon restart works afterwards', async () => {
+    const before = await fresh();
+    const nonce = before.pending.openPending('h1', 'oc_1', 'ou_g');
+    before.pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+
+    const after = await fresh({ keepPersisted: true });
+    const res = await after.handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), deps, 'h1');
+    expect(res?.toast).toBeUndefined();
+    expect(res?.body?.elements).toBeTruthy();
+    expect(after.registry.getBot('h1').config.chatGrants).toBeUndefined();
+    const later = await fresh({ keepPersisted: true });
+    expect(later.pending.throttleReason('h1', 'oc_1', 'ou_g')).toBe('denied');
   });
 
   it('stale nonce → expired toast, no grant', async () => {
