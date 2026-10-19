@@ -92,7 +92,7 @@ worker 解码 final → 投递飞书
 
 ### 5.2 `src/dsh-runner.ts`（新增，~450 行）
 
-**argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-profile`（可选，默认 `botmux`）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout`（默认 600s）。
+**argv**：`--session-id`（必填）、`--dsh-bin`（必填）、`--dsh-profile`（可选，默认 `botmux`）、`--cwd`、`--bot-name`、`--bot-open-id`、`--locale`、`--model`、`--turn-timeout-ms`（默认 600s 静默超时，最长 4 倍总时长）。
 
 **boot**：
 1. 解析 profile 名称：`--dsh-profile`（默认 `botmux`）。
@@ -114,7 +114,7 @@ worker 解码 final → 投递飞书
 - `session.status`：`running` 置忙、`idle` 且有 in-flight → 发 `final` marker `{content: 缓冲文本, usage, startedAtMs, completedAtMs, replyTurnId}`，清空缓冲。缓冲为空则 content 给 `''`（worker 有 pure-silence 抑制逻辑）。
 - JSON-RPC error response → `final` 带错误文本。
 
-**看门狗**：turn 超过 `--turn-timeout` → 杀 dsh 子进程、发 lifecycle fatal、退出非零（worker 重拉 runner；会话上下文丢失，日志明示）。
+**看门狗**：当前 turn 的工具调用、工具结果或助手消息可刷新 `--turn-timeout-ms` 静默超时；无进度超过该时长，或总时长达到其 4 倍 → 杀 dsh 子进程、发 lifecycle fatal、退出非零（worker 重拉 runner；会话上下文丢失，日志明示）。其它会话或未确认接收的事件不得续时。
 
 **子进程崩溃**：exit 事件先于 final → lifecycle fatal 退出。
 
@@ -177,7 +177,7 @@ runner 在首轮用户消息前插入（后续轮不插）：
 | dsh 二进制不存在 | resolveCommand 失败，setup/启动期报错（同其他 adapter） |
 | initialize 超时/失败 | lifecycle fatal，runner 退出非零，worker 展示失败 |
 | prompt JSON-RPC error | final 带错误文本，turn 正常收尾 |
-| turn 超时（默认 10min） | 杀 dsh + fatal 退出，worker 重拉（丢上下文，明示） |
+| turn 无进度超时（默认 10min）或硬上限（默认 40min） | 杀 dsh + fatal 退出，worker 重拉（丢上下文，明示） |
 | dsh 中途崩溃 | lifecycle fatal 退出 |
 | 空回复（只调工具无文本） | final content='' → worker 抑制投递（已有逻辑） |
 | 图片消息 | v1 转文本提示"暂不支持图片" |

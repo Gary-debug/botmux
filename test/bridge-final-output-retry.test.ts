@@ -340,7 +340,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   );
 
   it.each((['bridge', 'local-turn', 'local-turn-headless'] as const).flatMap(kind =>
-    (['minimax', 'traex', 'codex', 'claude-code'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
+    (['minimax', 'traex', 'codex', 'claude-code', 'dsh'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
     const content = ['实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -469,6 +469,22 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
     expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
     expect(sessionReply.mock.calls[1][5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+  });
+
+  it('retries a transient Lark failure for a DSH final without changing the reply', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'dsh';
+    ds.adoptedFrom = undefined;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, { ...finalOutputMsg(), content: 'DSH completed' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('delivers the body when the automatic image upload fails', async () => {

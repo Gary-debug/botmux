@@ -85,7 +85,10 @@ function waitFor(
 }
 
 describe('dsh worker final_output integration', () => {
-  it('delivers one final_output with correct content/turnId/usage and no OSC leak', async () => {
+  it.each([
+    { scenario: 'happy', timeoutMs: undefined },
+    { scenario: 'progressive', timeoutMs: 300 },
+  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-'));
     tempDirs.add(root);
     const fakeDsh = join(root, 'fake-dsh-server');
@@ -108,7 +111,7 @@ describe('dsh worker final_output integration', () => {
         BOTMUX_SESSION_ID: sessionId,
         LARK_APP_ID: 'app_dsh_it',
         LARK_APP_SECRET: 'secret',
-        FAKE_DSH_SCENARIO: 'happy',
+        FAKE_DSH_SCENARIO: scenario,
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -134,6 +137,7 @@ describe('dsh worker final_output integration', () => {
       larkAppId: 'app_dsh_it',
       larkAppSecret: 'secret',
       turnId: 'om_dsh_it_turn_1',
+      ...(timeoutMs ? { turnTimeoutMs: timeoutMs } : {}),
     };
 
     try {
@@ -148,12 +152,16 @@ describe('dsh worker final_output integration', () => {
       expect(finals[0].content).toContain('你好，我是 dsh。');
       expect(finals[0].turnId).toBe('om_dsh_it_turn_1');
       // Usage comes through the four-bucket shape.
-      expect(finals[0].usage).toEqual({
-        inputTokens: 100,
-        outputTokens: 42,
-        cacheReadTokens: 10,
-        cacheCreateTokens: 0,
-      });
+      if (scenario === 'happy') {
+        expect(finals[0].usage).toEqual({
+          inputTokens: 100,
+          outputTokens: 42,
+          cacheReadTokens: 10,
+          cacheCreateTokens: 0,
+        });
+      } else {
+        expect(finals[0].usage).toBeUndefined();
+      }
 
       // OSC control bytes must not appear in any screen/display payload.
       const screenLeaks = messages

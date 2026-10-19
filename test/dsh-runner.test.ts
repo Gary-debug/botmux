@@ -437,6 +437,46 @@ describe('dsh-runner', () => {
     expect(final.payload.content).toContain('timed out');
   }, 30_000);
 
+  it('keeps an active turn alive while its correlated tools make progress', async () => {
+    h = spawnRunner('progressive', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('long-running task'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('你好，我是 dsh。');
+    expect(h.child.exitCode).toBeNull();
+  }, 30_000);
+
+  it('still terminates a turn that emits progress forever', async () => {
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    h.child.stdin.write(makeFrame('never-ending task'));
+    expect(await exitPromise).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('hard limit');
+  }, 30_000);
+
+  it('does not extend the watchdog for notifications without this turn receipt', async () => {
+    h = spawnRunner('unclaimed-progress', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    h.child.stdin.write(makeFrame('unclaimed events'));
+    expect(await exitPromise).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('timed out after 300ms');
+    expect(finals[0].payload.content).not.toContain('hard limit');
+  }, 30_000);
+
   // -------------------------------------------------------------------------
   // Native ~/.dsh config (settings.yaml + .credentials.yaml)
   // -------------------------------------------------------------------------

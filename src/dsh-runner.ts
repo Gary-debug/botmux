@@ -41,6 +41,8 @@ import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+// Keep the normal 10-minute idle watchdog, but bound turns that keep reporting progress.
+const MAX_TURN_DURATION_MULTIPLIER = 4;
 // Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
 // ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
 // runner re-validates its own argv so a hand-crafted invocation can't arm an
@@ -82,6 +84,7 @@ interface PendingTurn {
   usage?: DshUsage;
   toolNames: Map<string, string>;
   timer: NodeJS.Timeout;
+  hardTimer: NodeJS.Timeout;
   /** Set from the session/prompt ACK; the turn only owns events at/after
    *  the matching agent/inbox/spliced receipt. */
   messageId?: string;
@@ -644,12 +647,17 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
 
 function processTurnNotification(turn: PendingTurn, method: string, p: Record<string, unknown>): void {
   if (method === 'session.event') {
+    const type = (p.event as { type?: unknown } | undefined)?.type;
+    if (type === 'tool/call' || type === 'tool/result' || type === 'assistant/message') {
+      refreshTurnIdleWatchdog(turn);
+    }
     handleSessionEvent(turn, p.event);
     return;
   }
   if (method === 'session.status' && p.status === 'idle' && activeTurn === turn) {
     activeTurn = undefined;
     clearTimeout(turn.timer);
+    clearTimeout(turn.hardTimer);
     lastTurnText = turn.textBuffer;
     lastTurnUsage = turn.usage;
     lastTurnError = turn.turnError;
@@ -692,6 +700,23 @@ let lastTurnText = '';
 let lastTurnUsage: DshUsage | undefined;
 let lastTurnError: string | undefined;
 
+function timeoutTurn(turn: PendingTurn, timeoutMs: number, hardLimit: boolean): void {
+  if (activeTurn !== turn) return;
+  activeTurn = undefined;
+  clearTimeout(turn.timer);
+  clearTimeout(turn.hardTimer);
+  turn.reject(new Error(`dsh turn timed out after ${timeoutMs}ms${hardLimit ? ' (hard limit)' : ''}`));
+}
+
+function refreshTurnIdleWatchdog(turn: PendingTurn): void {
+  if (activeTurn !== turn) return;
+  clearTimeout(turn.timer);
+  const timer = setTimeout(() => {
+    if (turn.timer === timer) timeoutTurn(turn, args.turnTimeoutMs, false);
+  }, args.turnTimeoutMs);
+  turn.timer = timer;
+}
+
 async function runTurn(content: string): Promise<void> {
   const startedAtMs = Date.now();
   writeLine();
@@ -702,12 +727,14 @@ async function runTurn(content: string): Promise<void> {
 
   const promptContent = firstTurn ? `${buildPreamble()}${content}` : content;
 
+  const hardTimeoutMs = Math.min(MAX_TURN_TIMEOUT_MS, args.turnTimeoutMs * MAX_TURN_DURATION_MULTIPLIER);
   const turnPromise = new Promise<void>((resolve, reject) => {
+    let turn!: PendingTurn;
     const timer = setTimeout(() => {
-      if (activeTurn?.timer === timer) activeTurn = undefined;
-      reject(new Error(`dsh turn timed out after ${args.turnTimeoutMs}ms`));
+      if (turn.timer === timer) timeoutTurn(turn, args.turnTimeoutMs, false);
     }, args.turnTimeoutMs);
-    activeTurn = {
+    const hardTimer = setTimeout(() => timeoutTurn(turn, hardTimeoutMs, true), hardTimeoutMs);
+    turn = {
       resolve,
       reject,
       startedAtMs,
@@ -716,7 +743,9 @@ async function runTurn(content: string): Promise<void> {
       pending: [],
       receiptReceived: false,
       timer,
+      hardTimer,
     };
+    activeTurn = turn;
   });
 
   try {
@@ -738,6 +767,7 @@ async function runTurn(content: string): Promise<void> {
   } catch (err) {
     if (activeTurn) {
       clearTimeout(activeTurn.timer);
+      clearTimeout(activeTurn.hardTimer);
       activeTurn = undefined;
     }
     throw err;
@@ -859,6 +889,7 @@ async function main(): Promise<void> {
       const turn = activeTurn;
       activeTurn = undefined;
       clearTimeout(turn.timer);
+      clearTimeout(turn.hardTimer);
       turn.reject(new Error(message));
     }
     setTimeout(() => process.exit(1), 100);
