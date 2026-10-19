@@ -88,6 +88,7 @@ describe('dsh worker final_output integration', () => {
   it.each([
     { scenario: 'happy', timeoutMs: undefined },
     { scenario: 'progressive', timeoutMs: 300 },
+    { scenario: 'empty', timeoutMs: undefined },
   ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-'));
     tempDirs.add(root);
@@ -149,7 +150,12 @@ describe('dsh worker final_output integration', () => {
         (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
       );
       expect(finals).toHaveLength(1);
-      expect(finals[0].content).toContain('你好，我是 dsh。');
+      if (scenario === 'empty') {
+        expect(finals[0].content).toContain('没有生成最终回复');
+        expect(finals[0].content).toContain('无法确认任务是否成功');
+      } else {
+        expect(finals[0].content).toContain('你好，我是 dsh。');
+      }
       expect(finals[0].turnId).toBe('om_dsh_it_turn_1');
       // Usage comes through the four-bucket shape.
       if (scenario === 'happy') {

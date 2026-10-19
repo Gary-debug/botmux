@@ -22,8 +22,8 @@
  * assistant/message events and delivered to botmux as a `final` control
  * frame; tool calls render as progress lines.
  *
- * The SDK protocol has no cancel: a wedged turn is reaped by the turn
- * watchdog, which kills the child and exits so botmux restarts the runner
+ * The SDK protocol has no cancel: an explicitly configured turn watchdog
+ * reaps wedged turns, killing the child so botmux restarts the runner
  * (the in-memory session is lost; sessions persist on disk under
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
@@ -40,8 +40,8 @@ import { errorMessage } from './utils/error-message.js';
 import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
 
 const DSH_MARKER = '::botmux-dsh:';
-const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
-// Keep the normal 10-minute idle watchdog, but bound turns that keep reporting progress.
+const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
+// Explicitly configured idle watchdogs also bound turns that keep reporting progress.
 const MAX_TURN_DURATION_MULTIPLIER = 4;
 // Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
 // ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
@@ -73,7 +73,7 @@ interface Args {
   model?: string;
   dshProfile?: string;
   bridgePatch?: string;
-  turnTimeoutMs: number;
+  turnTimeoutMs?: number;
 }
 
 interface PendingTurn {
@@ -83,8 +83,8 @@ interface PendingTurn {
   textBuffer: string;
   usage?: DshUsage;
   toolNames: Map<string, string>;
-  timer: NodeJS.Timeout;
-  hardTimer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
+  hardTimer?: NodeJS.Timeout;
   /** Set from the session/prompt ACK; the turn only owns events at/after
    *  the matching agent/inbox/spliced receipt. */
   messageId?: string;
@@ -107,7 +107,7 @@ const output = new RunnerControlWriter();
 const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { sessionId: '', dshBin: '', turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS };
+  const out: Args = { sessionId: '', dshBin: '' };
   parseRunnerFlags(argv, out, {
     '--session-id': 'sessionId',
     '--dsh-bin': 'dshBin',
@@ -120,8 +120,7 @@ function parseArgs(argv: string[]): Args {
     '--bridge-patch': 'bridgePatch',
     '--turn-timeout-ms': (target, val) => {
       const n = Number(val);
-      // Accept only a positive integer within the arm-able bound; anything else
-      // (≤0, non-integer, over-bound) is ignored → falls back to the default.
+      // The watchdog is opt-in. Invalid values leave it disabled.
       if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) target.turnTimeoutMs = n;
     },
   });
@@ -560,6 +559,7 @@ function buildPreamble(): string {
     '<botmux_identity>',
     `你是飞书群机器人「${name}」，通过 deepseek-harness 运行。`,
     '- 你的最终回复文本会被自动捕获并发送到群里，不要执行 botmux send 或任何发消息命令。',
+    '- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。',
     `- 工作目录：${cwd}。语言：${locale}。`,
     ...(() => {
       const prompt = larkToolPromptFromEnv(locale);
@@ -709,11 +709,12 @@ function timeoutTurn(turn: PendingTurn, timeoutMs: number, hardLimit: boolean): 
 }
 
 function refreshTurnIdleWatchdog(turn: PendingTurn): void {
-  if (activeTurn !== turn) return;
+  if (activeTurn !== turn || args.turnTimeoutMs === undefined) return;
   clearTimeout(turn.timer);
+  const timeoutMs = args.turnTimeoutMs;
   const timer = setTimeout(() => {
-    if (turn.timer === timer) timeoutTurn(turn, args.turnTimeoutMs, false);
-  }, args.turnTimeoutMs);
+    if (turn.timer === timer) timeoutTurn(turn, timeoutMs, false);
+  }, timeoutMs);
   turn.timer = timer;
 }
 
@@ -727,14 +728,8 @@ async function runTurn(content: string): Promise<void> {
 
   const promptContent = firstTurn ? `${buildPreamble()}${content}` : content;
 
-  const hardTimeoutMs = Math.min(MAX_TURN_TIMEOUT_MS, args.turnTimeoutMs * MAX_TURN_DURATION_MULTIPLIER);
   const turnPromise = new Promise<void>((resolve, reject) => {
-    let turn!: PendingTurn;
-    const timer = setTimeout(() => {
-      if (turn.timer === timer) timeoutTurn(turn, args.turnTimeoutMs, false);
-    }, args.turnTimeoutMs);
-    const hardTimer = setTimeout(() => timeoutTurn(turn, hardTimeoutMs, true), hardTimeoutMs);
-    turn = {
+    const turn: PendingTurn = {
       resolve,
       reject,
       startedAtMs,
@@ -742,10 +737,14 @@ async function runTurn(content: string): Promise<void> {
       toolNames: new Map(),
       pending: [],
       receiptReceived: false,
-      timer,
-      hardTimer,
     };
     activeTurn = turn;
+    if (args.turnTimeoutMs !== undefined) {
+      const timeoutMs = args.turnTimeoutMs;
+      const hardTimeoutMs = Math.min(MAX_TURN_TIMEOUT_MS, timeoutMs * MAX_TURN_DURATION_MULTIPLIER);
+      turn.timer = setTimeout(() => timeoutTurn(turn, timeoutMs, false), timeoutMs);
+      turn.hardTimer = setTimeout(() => timeoutTurn(turn, hardTimeoutMs, true), hardTimeoutMs);
+    }
   });
 
   try {
@@ -776,8 +775,9 @@ async function runTurn(content: string): Promise<void> {
   await turnPromise;
 
   const completedAtMs = Date.now();
-  const finalText = lastTurnText
-    || (lastTurnError ? `dsh 执行出错：${lastTurnError}` : '');
+  const finalText = lastTurnText.trim()
+    ? lastTurnText
+    : lastTurnError ? `dsh 执行出错：${lastTurnError}` : EMPTY_TURN_REPLY;
   const finalUsage = lastTurnUsage;
   emitMarker('final', {
     content: finalText,
@@ -785,7 +785,7 @@ async function runTurn(content: string): Promise<void> {
     startedAtMs,
     completedAtMs,
   });
-  if (!finalText.trim()) writeLine('[dsh] completed without text output.');
+  if (finalText === EMPTY_TURN_REPLY) writeLine('[dsh] completed without text output; sent a diagnostic reply.');
 }
 
 function isFatalRunnerError(err: unknown): boolean {
@@ -878,7 +878,9 @@ async function main(): Promise<void> {
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
-    BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)),
+    ...(args.turnTimeoutMs !== undefined
+      ? { BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) }
+      : {}),
   }, cwd);
   client.onNotification = handleNotification;
   client.onExit = (code, signal) => {

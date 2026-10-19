@@ -228,7 +228,7 @@ export interface CliAdapter {
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
     /** Optional per-bot turn timeout in milliseconds for runner-based adapters
-     *  (dsh). Forwarded as `--turn-timeout-ms` to override the runner default;
+     *  (dsh). Forwarded as `--turn-timeout-ms` to opt into an idle watchdog;
      *  adapters without a runner turn timeout ignore the field. */
     turnTimeoutMs?: number;
     /** Optional per-bot dsh profile name. Forwarded as `--dsh-profile` to the
