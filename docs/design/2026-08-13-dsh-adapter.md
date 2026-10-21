@@ -155,6 +155,7 @@ runner 在首轮用户消息前插入（后续轮不插）：
 <botmux_identity>
 你是飞书群机器人「<botName>」，通过 deepseek-harness 运行。
 - 你的最终回复文本会被自动捕获并发送到群里，**不要**执行 botmux send 或任何发消息命令。
+- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。
 - 工作目录：<cwd>。语言：<locale>。
 </botmux_identity>
 ```
